@@ -4,6 +4,8 @@ using Monocle;
 using MonoMod;
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices;
 using YamlDotNet.Serialization;
 
 namespace Celeste.Mod.Core {
@@ -140,6 +142,7 @@ namespace Celeste.Mod.Core {
 
         [SettingIgnore]
         public bool LazyLoading_Yes_I_Know_This_Can_Cause_Bugs { get; set; } = false;
+
         [SettingNeedsRelaunch]
         [SettingInGame(false)]
         [SettingIgnore] // TODO: Show as advanced setting.
@@ -160,10 +163,18 @@ namespace Celeste.Mod.Core {
         [SettingIgnore] // TODO: Show as advanced setting.
         public bool? ThreadedGL { get; set; } = null;
 
+        [YamlMember(Alias = "FastTextureLoading")]
+        [SettingIgnore]
+        public bool? _FastTextureLoading { get; set; } = null;
+
+        [YamlIgnore]
         [SettingNeedsRelaunch]
         [SettingInGame(false)]
         [SettingIgnore] // TODO: Show as advanced setting.
-        public bool? FastTextureLoading { get; set; } = null;
+        public bool? FastTextureLoading {
+            get => Everest.Content.DumpOnLoad || Everest.Content._DumpAll ? false : _FastTextureLoading;
+            set => _FastTextureLoading = value;
+        }
 
         [SettingNeedsRelaunch]
         [SettingInGame(false)]
@@ -230,6 +241,14 @@ namespace Celeste.Mod.Core {
             }
         }
 
+        public Everest.CompatMode CompatibilityMode { get; set; } = Everest.CompatMode.None; // TODO Better default logic
+
+        [SettingNeedsRelaunch]
+        [SettingName("MODOPTIONS_COREMODULE_D3D11EXCLUSIVEFULLSCREEN")]
+        [SettingSubText("MODOPTIONS_COREMODULE_D3D11EXCLUSIVEFULLSCREEN_DESC")]
+        [SettingInGame(false)]
+        public bool D3D11UseExclusiveFullscreen { get; set; }
+
         [SettingInGame(false)]
         public bool UseKeyboardForTextInput { get; set; } = true;
 
@@ -250,18 +269,39 @@ namespace Celeste.Mod.Core {
             }
         }
 
+        private bool _ColorizedLogging = true;
+        [SettingSubText("MODOPTIONS_COREMODULE_COLORIZEDLOGGING_DESC")]
+        [SettingInGame(false)]
+        public bool ColorizedLogging {
+            get => _ColorizedLogging;
+            set {
+                if (value && RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && !Logger.TryEnableWindowsVTSupport()) {
+                    Logger.Error("core", "Failed to enable Windows VT support!");
+                }
+                _ColorizedLogging = value;
+            }
+        }
+
+        // Keep in sync with https://github.com/EverestAPI/Olympus/blob/main/src/scenes/options.lua :: mirrorPreferences
+        public string MirrorPreferences { get; set; } = "gb,jade,otobot,wegfan";
+
         public bool DiscordRichPresence { get; set; } = true;
 
         [SettingIgnore]
         public bool DiscordShowIcon { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowMap { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowSide { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowRoom { get; set; } = false;
+
         [SettingIgnore]
         public bool DiscordShowBerries { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowDeaths { get; set; } = true;
 
@@ -286,13 +326,29 @@ namespace Celeste.Mod.Core {
         }
 
         [SettingIgnore]
+        public bool UseInGameCrashHandler { get; set; } = true;
+
+        [SettingIgnore]
+        public bool CrashHandlerAlwaysTeabag { get; set; } = false; // The world is a cruel place, so we can't turn this on by default... ._.
+
+        [SettingIgnore]
         public string CurrentVersion { get; set; }
 
-        [SettingIgnore]
-        public string CurrentBranch { get; set; }
+        private string _CurrentBranch;
 
         [SettingIgnore]
-        public Dictionary<string, LogLevel> LogLevels { get; set; } = new Dictionary<string, LogLevel>();
+        public string CurrentBranch {
+            get => _CurrentBranch;
+            set => _CurrentBranch = value is "dev" or "beta" or "stable" ? "updater_src_" + value : value; // branch names were changed at some point
+        }
+
+        private Dictionary<string, LogLevel> _LogLevels = new Dictionary<string, LogLevel>();
+
+        [SettingIgnore]
+        public Dictionary<string, LogLevel> LogLevels {
+            get => _LogLevels;
+            set => _LogLevels = value ?? new Dictionary<string, LogLevel>();
+        }
 
         [SettingSubHeader("MODOPTIONS_COREMODULE_MENUNAV_SUBHEADER")]
         [SettingInGame(false)]
@@ -302,6 +358,10 @@ namespace Celeste.Mod.Core {
         public ButtonBinding MenuPageDown { get; set; }
 
         [SettingSubHeader("MODOPTIONS_COREMODULE_DEBUGMODE_SUBHEADER")]
+        [SettingInGame(false)]
+        [DefaultButtonBinding(0, Keys.OemTilde)]
+        public ButtonBinding ToggleDebugConsole { get; set; }
+
         [SettingInGame(false)]
         [DefaultButtonBinding(0, Keys.OemPeriod)]
         public ButtonBinding DebugConsole { get; set; }
@@ -365,7 +425,7 @@ namespace Celeste.Mod.Core {
             List<string> inputGuiPrefixes = new List<string> {
                 "" // Auto
             };
-            foreach (KeyValuePair<string, MTexture> kvp in GFX.Gui.GetTextures()) {
+            foreach (KeyValuePair<string, MTexture> kvp in ((patch_Atlas) GFX.Gui).Textures) {
                 string path = kvp.Key;
                 if (!path.StartsWith("controls/"))
                     continue;
@@ -410,6 +470,55 @@ namespace Celeste.Mod.Core {
                     })
                 );
             }
+        }
+
+        public void CreateCompatibilityModeEntry(TextMenu menu, bool inGame) {
+            if (inGame)
+                return;
+
+            TextMenu.Slider compatSlider = new TextMenu.Slider(Dialog.Clean("modoptions_coremodule_compatmode"),
+                i => Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName((Everest.CompatMode) i)}"),
+                0, Enum.GetValues<Everest.CompatMode>().Length - 1, (int) CompatibilityMode
+            );
+            compatSlider.OnValueChange += val => CompatibilityMode = (Everest.CompatMode) val;
+            menu.Add(compatSlider);
+            compatSlider.NeedsRelaunch((patch_TextMenu) menu);
+
+            // We need to build our own description text as it is not static
+            TextMenuExt.EaseInSubHeaderExt descrTextA = new TextMenuExt.EaseInSubHeaderExt(Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName(CompatibilityMode)}_descr_a"), false, menu) {
+                TextColor = Color.Gray,
+                HeightExtra = 0f
+            };
+            TextMenuExt.EaseInSubHeaderExt descrTextB = new TextMenuExt.EaseInSubHeaderExt(Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName(CompatibilityMode)}_descr_b"), false, menu) {
+                TextColor = Color.DarkOrange,
+                HeightExtra = 0f
+            };
+            ((patch_TextMenu) menu).Insert(((patch_TextMenu) menu).Items.IndexOf(compatSlider) + 1, descrTextA);
+            ((patch_TextMenu) menu).Insert(((patch_TextMenu) menu).Items.IndexOf(compatSlider) + 2, descrTextB);
+
+            compatSlider.OnEnter += () => descrTextA.FadeVisible = descrTextB.FadeVisible = true;
+            compatSlider.OnLeave += () => descrTextA.FadeVisible = descrTextB.FadeVisible = false;
+            compatSlider.OnValueChange += val => {
+                descrTextA.Title = Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName((Everest.CompatMode) val)}_descr_a");
+                descrTextB.Title = Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName((Everest.CompatMode) val)}_descr_b");
+                menu.RecalculateSize();
+            };
+
+            // Show a warning if it is incompatible with the vanilla framework
+            TextMenuExt.EaseInSubHeaderExt warningText = new TextMenuExt.EaseInSubHeaderExt(Dialog.Clean($"modoptions_coremodule_compatmode_incompatible"), false, menu) {
+                TextColor = Color.OrangeRed,
+                HeightExtra = 0f
+            };
+            ((patch_TextMenu) menu).Insert(((patch_TextMenu) menu).Items.IndexOf(descrTextB) + 1, warningText);
+
+            static bool IsCompatible(Everest.CompatMode mode) =>
+                (Everest.Flags.VanillaIsFNA && mode == Everest.CompatMode.LegacyXNA) ||
+                (Everest.Flags.VanillaIsXNA && mode == Everest.CompatMode.LegacyFNA)
+            ;
+
+            compatSlider.OnEnter += () => warningText.FadeVisible = IsCompatible(CompatibilityMode);
+            compatSlider.OnLeave += () => warningText.FadeVisible = false;
+            compatSlider.OnValueChange += val => warningText.FadeVisible = IsCompatible((Everest.CompatMode) val);
         }
 
         public void CreateDiscordRichPresenceEntry(TextMenu menu, bool inGame) {
@@ -501,6 +610,30 @@ namespace Celeste.Mod.Core {
             showRoom.Disabled = !DiscordShowMap;
 
             menu.Add(submenu);
+        }
+
+        public void CreateMirrorPreferencesEntry(TextMenu menu, bool inGame) {
+            if (inGame) return;
+
+            List<string> mirrorPreferences = new List<string> {
+                "gb,jade,otobot,wegfan",
+                "jade,otobot,wegfan,gb",
+                "wegfan,otobot,jade,gb",
+                "otobot,jade,wegfan,gb"
+            };
+            List<string> dialogKeys = mirrorPreferences
+                .Select(setting => "MODOPTIONS_COREMODULE_MIRRORPREFERENCES_" + setting.Substring(0, setting.IndexOf(",")))
+                .ToList();
+
+            menu.Add(
+                new TextMenu.Slider(
+                    label: Dialog.Clean("MODOPTIONS_COREMODULE_MIRRORPREFERENCES"),
+                    values: index => Dialog.Clean(dialogKeys[index]),
+                    min: 0,
+                    max: mirrorPreferences.Count - 1,
+                    value: mirrorPreferences.IndexOf(MirrorPreferences)
+                ).Change(value => MirrorPreferences = mirrorPreferences[value])
+            );
         }
 
         public enum VanillaTristate {

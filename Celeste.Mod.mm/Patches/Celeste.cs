@@ -7,24 +7,28 @@ using Celeste.Mod.Helpers;
 using Microsoft.Xna.Framework;
 using Monocle;
 using MonoMod;
-using MonoMod.Utils;
 using System;
 using System.IO;
 using System.Linq;
-using System.Management;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using MonoMod.Cil;
+using MonoMod.Utils;
 using System.Text.RegularExpressions;
 using System.Text;
+using System.Reflection;
+using System.Runtime.Versioning;
+using System.ComponentModel;
 
 namespace Celeste {
     class patch_Celeste : Celeste {
 
         // We're effectively in Celeste, but still need to "expose" private fields to our mod.
         private bool firstLoad;
+
+        
 
         [PatchCelesteMain]
         public static extern void orig_Main(string[] args);
@@ -41,12 +45,6 @@ namespace Celeste {
 
             // we cannot use Everest.Flags.IsFNA at this point because flags aren't initialized yet.
             File.WriteAllText($"BuildIs{(typeof(Game).Assembly.FullName.Contains("FNA") ? "FNA" : "XNA")}.txt", "");
-
-            // macOS is FUN.
-            if (PlatformHelper.Is(MonoMod.Utils.Platform.MacOS)) {
-                // https://github.com/mono/mono/blob/79b6e3f256a59ede74596ce82547f320bf1e9a99/mono/metadata/filewatcher.c#L66
-                Environment.SetEnvironmentVariable("MONO_DARWIN_USE_KQUEUE_FSW", "1");
-            }
 
             if (File.Exists("everest-launch.txt")) {
                 args =
@@ -120,8 +118,16 @@ namespace Celeste {
                 }
             }
 
-            if (args.Contains("--console") && PlatformHelper.Is(MonoMod.Utils.Platform.Windows)) {
+            bool allocedConsole = false;
+            if (args.Contains("--console") && RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
                 AllocConsole();
+
+                // Invalidate console streams
+                typeof(Console).GetField("s_in", BindingFlags.NonPublic | BindingFlags.Static).SetValue(null, null);
+                typeof(Console).GetField("s_out", BindingFlags.NonPublic | BindingFlags.Static).SetValue(null, null);
+                typeof(Console).GetField("s_error", BindingFlags.NonPublic | BindingFlags.Static).SetValue(null, null);
+
+                allocedConsole = true;
             }
 
             if (args.Contains("--nolog")) {
@@ -170,31 +176,41 @@ namespace Celeste {
                     logfile += ".txt";
             }
 
+            Everest.PathLog = logfile;
+
             using (Stream fileStream = new FileStream(logfile, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
             using (StreamWriter fileWriter = new StreamWriter(fileStream, Console.OutputEncoding))
-            using (LogWriter logWriter = new LogWriter {
-                STDOUT = Console.Out,
-                File = fileWriter
-            }) {
-                try {
-                    Console.SetOut(logWriter);
+            using (LogWriter logWriter = new LogWriter(Console.Out, Console.Error, fileWriter)) {
+                Logger.outWriter = logWriter.STDOUT.Stream;
+                Logger.logWriter = logWriter.File;
 
-                    MainInner(args);
-                } finally {
-                    if (logWriter.STDOUT != null) {
-                        Console.SetOut(logWriter.STDOUT);
-                        logWriter.STDOUT = null;
-                    }
+                // Setup Windows VT support as early as possible, to avoid escape codes being printed
+                if (allocedConsole && Logger.earlyBootColorizedLogging && !Logger.TryEnableWindowsVTSupport()) {
+                    Logger.Error("core", "Failed to enable Windows VT support!");
                 }
-            }
 
+                MainInner(args);
+            }
         }
 
         private static void MainInner(string[] args) {
             AppDomain.CurrentDomain.UnhandledException += UnhandledExceptionHandler;
 
+            // Get the splash up and running asap
+            if (!args.Contains("--disable-splash") && File.Exists(Path.Combine(".", "EverestSplash", "EverestSplash.dll"))) {
+                string targetRenderer = "";
+                for (int i = 0; i < args.Length; i++) { // The splash will use the same renderer as fna
+                    if (args[i] == "--graphics" && args.Length > i + 1) {
+                        targetRenderer = args[i + 1];
+                    }
+                }
+
+                EverestSplashHandler.RunSplash(targetRenderer);
+            }
+
             try {
                 Everest.ParseArgs(args);
+                ParseFNAArgs(args);
                 orig_Main(args);
             } catch (Exception e) {
                 CriticalFailureHandler(e);
@@ -205,6 +221,31 @@ namespace Celeste {
 
             Everest.Shutdown();
         }
+
+        private static void ParseFNAArgs(string[] args) {
+            // FNA's main function already does this, but it doesn't work on Linux because the runtime doesn't call setenv :catassault:
+
+            static void SetEnvVar(string name, string value) {
+                Environment.SetEnvironmentVariable(name, value);
+
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                    if (setenv(name, value, 1) != 0)
+                        throw new Win32Exception();
+            }
+
+            SetEnvVar("FNA_AUDIO_DISABLE_SOUND", "1");
+            for (int i = 0; i < args.Length; i++) {
+                if (args[i] == "--graphics" && i < args.Length - 1) {
+                    SetEnvVar("FNA3D_FORCE_DRIVER", args[i + 1]);
+                    i++;
+                }
+                // No --disable-lateswaptear as that is now explicitly opt-in
+            }
+        }
+
+        [SupportedOSPlatform("linux")]
+        [DllImport("libc", CallingConvention=CallingConvention.Cdecl, SetLastError=true)]
+        private extern static int setenv(string name, string val, int overwrite);
 
         private static void UnhandledExceptionHandler(object sender, UnhandledExceptionEventArgs e) {
             if (e.IsTerminating) {
@@ -220,8 +261,14 @@ namespace Celeste {
         public static void CriticalFailureHandler(Exception e) {
             Everest.LogDetours();
 
-            (e ?? new Exception("Unknown exception")).LogDetailed("CRITICAL");
+            e ??= new Exception("Unknown exception");
 
+            e.LogDetailed("CRITICAL");
+
+            // here (ever) rests a tribute to everest in your everest
+            // 2020/02/24 - 2024/03/12
+
+            /*
             ErrorLog.Write(
 @"Yo, I heard you like Everest so I put Everest in your Everest so you can Ever Rest while you Ever Rest.
 
@@ -230,7 +277,9 @@ In other words: Celeste has encountered a catastrophic failure.
 IF YOU WANT TO HELP US FIX THIS:
 Please join the Celeste Discord server and drag and drop your log.txt into #modding_help.
 https://discord.gg/6qjaePQ");
+            */
 
+            ErrorLog.Write(e);
             ErrorLog.Open();
             if (!_CriticalFailureIsUnhandledException)
                 Environment.Exit(-1);
@@ -252,10 +301,13 @@ https://discord.gg/6qjaePQ");
             } else {
                 orig_ctor_Celeste();
             }
+
+            Logger.Info("boot", $"Active compatibility mode: {Everest.CompatibilityMode}");
+
             try {
                 Everest.Boot();
             } catch (Exception e) {
-                e.LogDetailed();
+                Logger.LogDetailed(e);
                 /*
                 ErrorLog.Write(e);
                 ErrorLog.Open();
@@ -285,7 +337,7 @@ https://discord.gg/6qjaePQ");
              * Loading in a new thread with texture -> GPU ops on the main thread helps barely.
              * Spawning a new thread just to wait for it to end doesn't make much sense,
              * BUT delaying the slow texture load ops to happen lazy-async gets the game window to appear sooner.
-             * 
+             *
              * Note that on XNA, this dies both with and without threaded GL due to OOM exceptions.
              * -ade
              */
@@ -316,6 +368,12 @@ https://discord.gg/6qjaePQ");
             Everest._ContentLoaded = true;
         }
 
+        protected override void BeginRun() {
+            base.BeginRun();
+            // This is as close as we can get to the showwindow call
+            EverestSplashHandler.StopSplash();
+        }
+
         protected override void OnExiting(object sender, EventArgs args) {
             base.OnExiting(sender, args);
             Everest.Events.Celeste.Exiting();
@@ -340,6 +398,48 @@ namespace MonoMod {
                 cursor.Next.OpCode = OpCodes.Ldstr;
                 cursor.Next.Operand = "Windows";
             }
+
+            cursor.Index = 0;
+
+            // remove the redundant Console.WriteLine(Exception) - ErrorLog.Write(Exception) already logs the error for us
+            if (!cursor.TryGotoNext(
+                static instr => instr.MatchDup(),
+                static instr => instr.MatchCallvirt("System.Object", "ToString"),
+                static instr => instr.MatchCall("System.Console", "WriteLine")
+            ))
+                throw new Exception(
+                    $"Could not find [dup], [callvirt instance string System.Object::ToString()], [call void System.Console::WriteLine(string)] in {context.Method.FullName}!");
+
+            // nop the writeline out
+            // cannot remove instructions because this will cause an invalid program
+            // (seems to be related to the try/catch blocks, didn't investigate further)
+            for (int i = 0; i < 3; i++) {
+                cursor.Next.OpCode = OpCodes.Nop;
+                cursor.Next.Operand = null;
+                cursor.Index++;
+            }
+
+            // log the exception to log.txt if opening the error log fails so that we have something to investigate
+            if (!cursor.TryGotoNext(static instr => instr.MatchLdstr("Failed to open the log!")))
+                throw new Exception(
+                    $"Could not find [ldstr \"Failed to open the log!\"] in {context.Method.FullName}!");
+
+            // capture the previously thrown away exception when failing to open the error log
+            context.Body.ExceptionHandlers[0].CatchType = context.Import(typeof(Exception));
+            cursor.Prev.OpCode = OpCodes.Ldstr;  // previously a pop
+            cursor.Prev.Operand = "ErrorLog";
+
+            TypeDefinition logger = RulesModule.GetType("Celeste.Mod", "Logger");
+
+            // replace the Console.WriteLine with a Logger.Error
+            cursor.Index++;
+            cursor.Next.Operand = context.Module.ImportReference(logger.FindMethod("Error"));
+
+            // add a Logger.LogDetailed
+            // (exception still on the stack)
+            cursor.Index++;
+            cursor.EmitLdnull();
+            cursor.EmitCall(context.Module.ImportReference(logger.FindMethod("System.Void LogDetailed(System.Exception,System.String)")));
         }
 
     }

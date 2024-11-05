@@ -66,11 +66,11 @@ namespace Celeste {
             if (data.CustomFills == null && data.ScanWidth == 3 && data.ScanHeight == 3 && !xml.HasChild("define")) // ReadIntoCustomTemplate can handle vanilla templates but meh
                 orig_ReadInto(data, tileset, xml);
             else {
-                Logger.Log(LogLevel.Debug, "Autotiler", $"Reading template for tileset with id '{data.ID}', scan height {data.ScanHeight}, and scan width {data.ScanWidth}.");
+                Logger.Debug("Autotiler", $"Reading template for tileset with id '{data.ID}', scan height {data.ScanHeight}, and scan width {data.ScanWidth}.");
                 ReadIntoCustomTemplate(data, tileset, xml);
             }
 
-            if (xml.HasAttr("soundPath") && xml.HasAttr("sound")) { // Could accommodate for no sound attr, but requiring it should improve clarity on user's end 
+            if (xml.HasAttr("soundPath") && xml.HasAttr("sound")) { // Could accommodate for no sound attr, but requiring it should improve clarity on user's end
                 SurfaceIndex.TileToIndex[xml.AttrChar("id")] = xml.AttrInt("sound");
                 patch_SurfaceIndex.IndexToCustomPath[xml.AttrInt("sound")] = (xml.Attr("soundPath").StartsWith("event:/") ? "" : "event:/") + xml.Attr("soundPath");
             } else if (xml.HasAttr("sound")) {
@@ -81,6 +81,14 @@ namespace Celeste {
 
             if (xml.HasAttr("debris"))
                 data.Debris = xml.Attr("debris");
+
+            if (xml.HasAttr("ignoreExceptions")) {
+                string[] array = xml.Attr("ignoreExceptions").Split(',');
+
+                foreach (string text in array)
+					if (text.Length > 0)
+						data.IgnoreExceptions.Add(text[0]);
+            }
         }
 
         private void ReadIntoCustomTemplate(patch_TerrainType data, Tileset tileset, XmlElement xml) {
@@ -91,12 +99,12 @@ namespace Celeste {
                         patch_Tiles tiles;
                         if (text == "center") {
                             if (data.CustomFills != null)
-                                Logger.Log(LogLevel.Warn, "Autotiler", $"\"Center\" tiles for tileset with id '{data.ID}' will not be used if custom fills are present.");
+                                Logger.Warn("Autotiler", $"\"Center\" tiles for tileset with id '{data.ID}' will not be used if custom fills are present.");
 
                             tiles = data.Center;
                         } else if (text == "padding") {
                             if (data.CustomFills != null)
-                                Logger.Log(LogLevel.Warn, "Autotiler", $"\"Padding\" tiles for tileset with id '{data.ID}' will not be used if custom fills are present.");
+                                Logger.Warn("Autotiler", $"\"Padding\" tiles for tileset with id '{data.ID}' will not be used if custom fills are present.");
 
                             tiles = data.Padded;
                         } else if (text.StartsWith("fill")) {
@@ -132,10 +140,10 @@ namespace Celeste {
                                             if (char.IsLetter(c))
                                                 masked.Mask[i++] = GetByteLookup(c);
                                             break;
-                                        /* 
-                                         * Error handling for characters that don't exist in a defined filter could be added,
-                                         * but is slightly more likely to break old custom tilesets if someone has defined a mask that containes nonstandard spacers (usually '-')
-                                        */
+                                            /*
+                                             * Error handling for characters that don't exist in a defined filter could be added,
+                                             * but is slightly more likely to break old custom tilesets if someone has defined a mask that containes nonstandard spacers (usually '-')
+                                            */
                                     }
                                 }
                             } catch (IndexOutOfRangeException e) {
@@ -245,7 +253,7 @@ namespace Celeste {
 
             // Satisfies error handling for the orig_ method too.
             if (!lookup.TryGetValue(tile, out patch_TerrainType terrainType)) {
-                Logger.Log(LogLevel.Error, "Autotiler", $"Undefined tile id '{tile}' at ({x}, {y})");
+                Logger.Error("Autotiler", $"Undefined tile id '{tile}' at ({x}, {y})");
                 return new patch_Tiles {
                     Textures = { ((patch_Atlas) GFX.Game).GetFallback() },
                 };
@@ -389,6 +397,10 @@ namespace Celeste {
         // Required because TerrainType is private.
         private class patch_TerrainType {
             public char ID;
+
+            public HashSet<char> Ignores;
+            public HashSet<char> IgnoreExceptions;
+
             public List<patch_Masked> Masked;
             public patch_Tiles Center;
             public patch_Tiles Padded;
@@ -402,18 +414,24 @@ namespace Celeste {
             public Dictionary<byte, string> whitelists;
             public Dictionary<byte, string> blacklists;
 
-            [MonoModIgnore]
-            public extern bool Ignore(char c);
-
             public extern void orig_ctor(char id);
             [MonoModConstructor]
             public void ctor(char id) {
                 orig_ctor(id);
 
+                IgnoreExceptions = new HashSet<char>();
+
                 whitelists = new Dictionary<byte, string>();
                 blacklists = new Dictionary<byte, string>();
             }
 
+            [MonoModReplace]
+            public bool Ignore(char c) {
+                if (ID == c || IgnoreExceptions.Contains(c))
+                    return false;
+
+                return Ignores.Contains('*') || Ignores.Contains(c);
+            }
         }
 
         // Required because Tiles is private.

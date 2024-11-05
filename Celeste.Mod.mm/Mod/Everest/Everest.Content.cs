@@ -1,10 +1,9 @@
-﻿using Celeste.Mod.Helpers;
+using Celeste.Mod.Helpers;
 using Celeste.Mod.Meta;
 using Ionic.Zip;
 using MAB.DotIgnore;
 using Microsoft.Xna.Framework.Graphics;
 using Monocle;
-using MonoMod.Utils;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -13,11 +12,12 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Celeste.Mod {
 
     /// <summary>
-    /// Special meta type for assets. 
+    /// Special meta type for assets.
     /// A ModAsset with a Type field that subclasses from this will not log path conflicts.
     /// </summary>
     public abstract class AssetTypeNonConflict { }
@@ -38,6 +38,7 @@ namespace Celeste.Mod {
     public sealed class AssetTypeDirectory : AssetTypeNonConflict { private AssetTypeDirectory() { } }
     public sealed class AssetTypeMetadataYaml : AssetTypeNonConflict { private AssetTypeMetadataYaml() { } }
     public sealed class AssetTypeSpriteBank : AssetTypeNonConflict { private AssetTypeSpriteBank() { } }
+    public sealed class AssetTypeEverestIgnore : AssetTypeNonConflict { private AssetTypeEverestIgnore() { } }
 
     // Generic asset types
     public sealed class AssetTypeLua { private AssetTypeLua() { } }
@@ -180,8 +181,8 @@ namespace Celeste.Mod {
 
                 watcher.EnableRaisingEvents = true;
             } catch (Exception e) {
-                Logger.Log(LogLevel.Warn, "content", $"Failed watching folder: {path}");
-                e.LogDetailed();
+                Logger.Warn("content", $"Failed watching folder: {path}");
+                Logger.LogDetailed(e);
                 watcher?.Dispose();
                 watcher = null;
             }
@@ -206,7 +207,7 @@ namespace Celeste.Mod {
                 lastIndexOfSlash >= root.Length && // Make sure to not skip crawling in hidden mods.
                 dir.Length > lastIndexOfSlash + 1 &&
                 dir[lastIndexOfSlash + 1] == '.') {
-                // Logger.Log(LogLevel.Verbose, "content", $"Skipped crawling hidden file or directory {dir.Substring(root.Length + 1)}");
+                // Logger.Verbose("content", $"Skipped crawling hidden file or directory {dir.Substring(root.Length + 1)}");
                 return;
             }
 
@@ -282,12 +283,12 @@ namespace Celeste.Mod {
             if (e.ChangeType == WatcherChangeTypes.Changed && Directory.Exists(e.FullPath))
                 return;
 
-            Logger.Log(LogLevel.Verbose, "content", $"File updated: {e.FullPath} - {e.ChangeType}");
+            Logger.Verbose("content", $"File updated: {e.FullPath} - {e.ChangeType}");
             QueuedTaskHelper.Do(e.FullPath, () => Update(e.FullPath, e.FullPath));
         }
 
         private void FileRenamed(object source, RenamedEventArgs e) {
-            Logger.Log(LogLevel.Verbose, "content", $"File renamed: {e.OldFullPath} - {e.FullPath}");
+            Logger.Verbose("content", $"File renamed: {e.OldFullPath} - {e.FullPath}");
             QueuedTaskHelper.Do(Tuple.Create(e.OldFullPath, e.FullPath), () => Update(e.OldFullPath, e.FullPath));
         }
 
@@ -510,7 +511,7 @@ namespace Celeste.Mod {
             };
 
             internal readonly static HashSet<string> BlacklistExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
-                ".cs", ".csproj", ".md", ".pdb", ".sln", ".yaml-backup"
+                ".cs", ".csproj", ".md", ".pdb", ".sln", ".yaml-backup", ".gitignore"
             };
 
             internal readonly static HashSet<string> BlacklistRootFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
@@ -531,7 +532,7 @@ namespace Celeste.Mod {
                 Celeste.Instance.Content = new EverestContentManager(Celeste.Instance.Content);
 
                 Directory.CreateDirectory(PathContentOrig = Path.Combine(PathGame, Celeste.Instance.Content.RootDirectory));
-                Directory.CreateDirectory(PathDUMP = Path.Combine(PathEverest, "ModDUMP"));
+                PathDUMP = Path.Combine(PathEverest, "ModDUMP");
 
                 Crawl(new AssemblyModContent(typeof(Everest).Assembly) {
                     Name = "Everest",
@@ -632,7 +633,7 @@ namespace Celeste.Mod {
                     if (pathSplit[i].StartsWith(".") || BlacklistFolders.Contains(pathSplit[i]) || (i == 0 && BlacklistRootFolders.Contains(pathSplit[0])))
                         return false;
                 }
-                
+
                 if (metadata != null &&
                     (metadata.Source?.Ignore?.IsIgnored(path, metadata.Type == typeof(AssetTypeDirectory)) ?? false)) {
                     return false;
@@ -663,7 +664,7 @@ namespace Celeste.Mod {
 
                     } else {
                         if (Map.TryGetValue(path, out ModAsset existing) && existing != null && existing.Source != metadata.Source && !existing.Type.IsSubclassOf(typeof(AssetTypeNonConflict))) {
-                            Logger.Log(LogLevel.Warn, "content", $"CONFLICT for asset path {path} ({existing?.Source?.Name ?? "???"} vs {metadata?.Source?.Name ?? "???"})");
+                            Logger.Warn("content", $"CONFLICT for asset path {path} ({existing?.Source?.Name ?? "???"} vs {metadata?.Source?.Name ?? "???"})");
                         }
 
                         Map[path] = metadata;
@@ -715,7 +716,7 @@ namespace Celeste.Mod {
             /// </summary>
             public static event TypeGuesser OnGuessType;
             /// <summary>
-            /// Guess the file type and format based on its path. 
+            /// Guess the file type and format based on its path.
             /// </summary>
             /// <param name="file">The relative asset path.</param>
             /// <param name="type">The file type.</param>
@@ -727,7 +728,7 @@ namespace Celeste.Mod {
                 if (format.Length >= 1)
                     format = format.Substring(1);
 
-                // Assign game asset types 
+                // Assign game asset types
                 if (format == "dll") {
                     type = typeof(AssetTypeAssembly);
 
@@ -789,6 +790,10 @@ namespace Celeste.Mod {
                         file += ".guids";
                     }
 
+                } else if (file == ".everestignore") {
+                    type = typeof(AssetTypeEverestIgnore);
+                    file = "";
+
                 } else if (OnGuessType != null) {
                     // Parse custom types from mods
                     Delegate[] ds = OnGuessType.GetInvocationList();
@@ -837,7 +842,7 @@ namespace Celeste.Mod {
             public static void Update(ModAsset prev, ModAsset next) {
                 if (prev != null) {
                     foreach (object target in prev.Targets) {
-                        if (target is MTexture mtex) {
+                        if (target is patch_MTexture mtex) {
                             AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_UNLOADINGTEXTURE")} {Path.GetFileName(prev.PathVirtual)}", () => {
                                 mtex.UndoOverride(prev);
                             });
@@ -863,19 +868,19 @@ namespace Celeste.Mod {
                             .FirstOrDefault(modeSel => modeSel?.MapData?.Filename == mapName);
 
                         if (mode != null) {
-                            AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_RELOADINGMAPNAME")} {name}", () => {
+                            AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_RELOADINGMAPNAME")} {name}", _ => {
                                 mode.MapData.Reload();
-                            });
-
-                            if (levelPrev?.Session.MapData == mode.MapData)
-                                AssetReloadHelper.ReloadLevel();
-
+                                return Task.CompletedTask;
+                            }).ContinueWith(_ => MainThreadHelper.Schedule(() => {
+                                if (levelPrev?.Session.MapData == mode.MapData)
+                                    AssetReloadHelper.ReloadLevel();
+                            }));
                         } else {
                             // What can go wrong?
-                            AssetReloadHelper.Do(Dialog.Clean("ASSETRELOADHELPER_RELOADINGALLMAPS"), () => {
+                            AssetReloadHelper.Do(Dialog.Clean("ASSETRELOADHELPER_RELOADINGALLMAPS"), _ => {
                                 AssetReloadHelper.ReloadAllMaps();
-                            });
-                            AssetReloadHelper.ReloadLevel();
+                                return Task.CompletedTask;
+                            }).ContinueWith(_ => AssetReloadHelper.ReloadLevel());
                         }
 
                     } else if (next.Type == typeof(AssetTypeXml) || next.Type == typeof(AssetTypeSpriteBank)) {
@@ -913,9 +918,9 @@ namespace Celeste.Mod {
                         } else {
                             MTNExt.ObjModelCache.Remove(next.PathVirtual + ".export");
                         }
-                        MainThreadHelper.Do(() => MTNExt.ReloadModData());
+                        MainThreadHelper.Schedule(() => MTNExt.ReloadModData());
                     } else if (next.Type == typeof(AssetTypeFont)) {
-                        MainThreadHelper.Do(() => Fonts.Reload());
+                        MainThreadHelper.Schedule(() => Fonts.Reload());
                     }
 
                     // Loaded assets can be folders, which means that we need to check the updated assets' entire path.
@@ -954,7 +959,7 @@ namespace Celeste.Mod {
 
                 if (_ContentLoaded) {
                     // We're late-loading this mod and thus need to manually ingest new assets.
-                    Logger.Log(LogLevel.Verbose, "content", $"Late ingest via update for {meta.Name}");
+                    Logger.Verbose("content", $"Late ingest via update for {meta.Name}");
 
                     Stopwatch loadTimerPrev = Celeste.LoadTimer; // Trick AssetReloadHelper into insta-running callbacks.
                     Stopwatch loadTimer = Stopwatch.StartNew();
@@ -1013,18 +1018,18 @@ namespace Celeste.Mod {
                 if (asset == null || mapping == null)
                     return;
 
-                if (asset is Atlas atlas) {
+                if (asset is patch_Atlas atlas) {
                     string reloadingText = Dialog.Language == null ? "" : Dialog.Clean(mapping.Children.Count == 0 ? "ASSETRELOADHELPER_RELOADINGTEXTURE" : "ASSETRELOADHELPER_RELOADINGTEXTURES");
                     AssetReloadHelper.Do(load, $"{reloadingText} {Path.GetFileName(mapping.PathVirtual)}", () => {
                         atlas.ResetCaches();
-                        (atlas as patch_Atlas).Ingest(mapping);
+                        atlas.Ingest(mapping);
                     });
 
                     // if the atlas is (or contains) an emoji, register it.
                     if (Emoji.IsInitialized()) {
                         if (refreshEmojis(mapping)) {
-                            MainThreadHelper.Do(() => {
-                                Logger.Log(LogLevel.Verbose, "content", "Reloading fonts after late emoji registration");
+                            MainThreadHelper.Schedule(() => {
+                                Logger.Verbose("content", "Reloading fonts after late emoji registration");
                                 Fonts.Reload();
                             });
                         }
@@ -1033,7 +1038,7 @@ namespace Celeste.Mod {
                     if ((MTNExt.ModsLoaded || MTNExt.ModsDataLoaded) && potentiallyContainsMountainTextures(mapping)) {
                         AssetReloadHelper.Do(load, Dialog.Clean("ASSETRELOADHELPER_RELOADINGMOUNTAIN"), () => {
                             MTNExt.ReloadMod();
-                            MainThreadHelper.Do(() => MTNExt.ReloadModData());
+                            MainThreadHelper.Schedule(() => MTNExt.ReloadModData());
                         });
                     }
                 }
@@ -1055,7 +1060,7 @@ namespace Celeste.Mod {
                     }
                 } else if (mapping.PathVirtual.StartsWith("Graphics/Atlases/Gui/emoji/")) {
                     string emojiName = mapping.PathVirtual.Substring(27);
-                    Logger.Log(LogLevel.Verbose, "content", $"Late registering emoji: {emojiName}");
+                    Logger.Verbose("content", $"Late registering emoji: {emojiName}");
                     Emoji.Register(emojiName, GFX.Gui["emoji/" + emojiName]);
                     return true;
                 }
@@ -1092,7 +1097,7 @@ namespace Celeste.Mod {
 
                 // TODO: Find how to differentiate between Packer and PackerNoAtlas
                 foreach (string file in Directory.EnumerateFiles(Path.Combine(PathContentOrig, "Graphics", "Atlases"), "*.meta", SearchOption.AllDirectories)) {
-                    Logger.Log(LogLevel.Verbose, "dump-all-atlas-meta", "file: " + file);
+                    Logger.Verbose("dump-all-atlas-meta", "file: " + file);
                     // THIS IS HORRIBLE.
                     try {
                         Atlas.FromAtlas(file.Substring(0, file.Length - 5), Atlas.AtlasDataFormat.Packer).Dispose();
@@ -1119,7 +1124,7 @@ namespace Celeste.Mod {
                 string pathDump = Path.Combine(PathDUMP, assetName);
                 Directory.CreateDirectory(Path.GetDirectoryName(pathDump));
 
-                Logger.Log(LogLevel.Verbose, "dump", $"{assetNameFull} {asset.GetType().FullName}");
+                Logger.Verbose("dump", $"{assetNameFull} {asset.GetType().FullName}");
 
                 if (asset is IMeta) {
                     if (!File.Exists(pathDump + ".meta.yaml"))
@@ -1153,7 +1158,7 @@ namespace Celeste.Mod {
                     }
                     /**/
 
-                } else if (asset is Atlas atlas) {
+                } else if (asset is patch_Atlas atlas) {
 
                     /*
                     for (int i = 0; i < atlas.Sources.Count; i++) {
@@ -1171,7 +1176,7 @@ namespace Celeste.Mod {
                     }
                     */
 
-                    Dictionary<string, MTexture> textures = atlas.GetTextures();
+                    Dictionary<string, MTexture> textures = atlas.Textures;
                     foreach (KeyValuePair<string, MTexture> kvp in textures) {
                         string name = kvp.Key;
                         MTexture source = kvp.Value;

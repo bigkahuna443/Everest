@@ -11,9 +11,10 @@ using System.Linq;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using MonoMod.Cil;
+using Celeste.Mod.Helpers;
 
 namespace Celeste {
-    class patch_MapData : MapData {
+    public class patch_MapData : MapData {
 
         public bool DetectedCassette;
         public int DetectedStrawberriesIncludingUntracked;
@@ -26,11 +27,11 @@ namespace Celeste {
 
         public MapMetaModeProperties Meta {
             get {
-                MapMeta metaAll = AreaData.Get(Area).GetMeta();
+                MapMeta metaAll = patch_AreaData.Get(Area).Meta;
                 return
                     (metaAll?.Modes?.Length ?? 0) > (int) Area.Mode ?
-                    metaAll.Modes[(int) Area.Mode] :
-                    null;
+                        metaAll.Modes[(int) Area.Mode] :
+                        null;
             }
         }
 
@@ -65,13 +66,13 @@ namespace Celeste {
                     }
                 }
 
-                AreaData area = AreaData.Get(Area);
-                AreaData parentArea = AreaDataExt.Get(area.GetMeta()?.Parent);
+                patch_AreaData area = patch_AreaData.Get(Area);
+                AreaData parentArea = patch_AreaData.Get(area.Meta?.Parent);
                 ModeProperties parentMode = parentArea?.Mode?.ElementAtOrDefault((int) Area.Mode);
                 if (parentMode != null) {
                     MapData parentMapData = parentMode.MapData;
                     if (parentMapData == null) {
-                        Logger.Log(LogLevel.Warn, "MapData", $"Failed auto-assigning data from {Area} to its unloaded parent");
+                        Logger.Warn("MapData", $"Failed auto-assigning data from {Area} to its unloaded parent");
                         return;
                     }
 
@@ -105,24 +106,34 @@ namespace Celeste {
                 }
 
             } catch (Exception e) when (e is not OutOfMemoryException) { // OOM errors are currently unrecoverable
-                Logger.Log(LogLevel.Warn, "MapData", $"Failed loading MapData {Area}");
-                e.LogDetailed();
+                Logger.Warn("MapData", $"Failed loading MapData {Area}");
+                Logger.LogDetailed(e);
             }
         }
 
         public extern LevelData orig_StartLevel();
         public new LevelData StartLevel() {
             MapMetaModeProperties meta = Meta;
-            if (meta != null) {
-                if (!string.IsNullOrEmpty(meta.StartLevel)) {
-                    LevelData level = Levels.FirstOrDefault(_ => _.Name == meta.StartLevel);
-                    if (level != null)
-                        return level;
-                }
+            LevelData level;
+            if (!string.IsNullOrEmpty(meta?.StartLevel)) {
+                level = Levels.FirstOrDefault(lvl => lvl.Name == meta.StartLevel);
+                if (level != null)
+                    return level;
 
+                Logger.Warn("MapData", $"The starting room defined in metadata, \"{meta.StartLevel}\", does not exist for map {((patch_AreaData) Data)?.SID}!");
             }
 
-            return orig_StartLevel() ?? Levels[0];
+            level = orig_StartLevel();
+            if (level != null)
+                return level;
+
+            Logger.Debug("MapData", $"There is no room at (0,0) in map {((patch_AreaData) Data)?.SID}, attempting fallback to the first room.");
+            level = Levels.FirstOrDefault();
+
+            if (level == null) {
+                Logger.Warn("MapData", $"Map {((patch_AreaData) Data)?.SID} has no rooms!");
+            }
+            return level;
         }
 
         [MonoModReplace]
@@ -147,7 +158,7 @@ namespace Celeste {
                 if (!levelsByName.ContainsKey(level.Name)) {
                     levelsByName.Add(level.Name, level);
                 } else {
-                    Logger.Log(LogLevel.Warn, "MapData", $"Failed to load duplicate room name {level.Name}");
+                    Logger.Warn("MapData", $"Failed to load duplicate room name {level.Name} in map {((patch_AreaData) Data)?.SID}");
                 }
             }
         }
@@ -159,12 +170,17 @@ namespace Celeste {
         }
 
         private BinaryPacker.Element Process(BinaryPacker.Element root) {
-            if (root.Children == null)
+            if (root.Children == null) {
+                ProcessMeta(null);
                 return root;
+            }
 
             // make sure parse meta first, because checkpoint entity needs to read meta
-            if (root.Children.Find(element => element.Name == "meta") is BinaryPacker.Element meta)
+            if (root.Children.Find(element => element.Name == "meta") is BinaryPacker.Element meta) {
                 ProcessMeta(meta);
+            } else {
+                ProcessMeta(null);
+            }
 
             new MapDataFixup(this).Process(root);
 
@@ -172,15 +188,45 @@ namespace Celeste {
         }
 
         private void ProcessMeta(BinaryPacker.Element meta) {
-            AreaData area = AreaData.Get(Area);
+            patch_AreaData area = patch_AreaData.Get(Area);
             AreaMode mode = Area.Mode;
 
+            MapMeta metaParsedFromFile = null;
+            MapMeta metaParsed = null;
+
+            // load metadata from .meta.yaml file
+            string path = $"Maps/{area.Mode[(int) mode].Path}";
+            if (Everest.Content.TryGet(path, out ModAsset asset)) {
+                metaParsedFromFile = asset.GetMeta<MapMeta>();
+                if (metaParsedFromFile != null) {
+                    metaParsedFromFile.Modes[(int) mode] = MapMetaModeProperties.Add(metaParsedFromFile.Mode, metaParsedFromFile.Modes[(int) mode]);
+                    metaParsedFromFile.Mode = null;
+                }
+            }
+
+            // load metadata from .bin file
+            if (meta != null) {
+                metaParsed = new MapMeta(meta);
+                metaParsed.Modes[(int) mode] = MapMetaModeProperties.Add(metaParsed.Mode, metaParsed.Modes[(int) mode]);
+                metaParsed.Mode = null;
+            }
+
+            // merge metadata, with .meta.yaml taking priority
+            metaParsed = MapMeta.Add(metaParsedFromFile, metaParsed);
+
+            // merge metadata with the existing meta, with the previously merged metadata taking priority
+            MapMeta combinedMeta = MapMeta.Add(metaParsed, area.Meta);
+
+            // apply metadata to AreaData
             if (mode == AreaMode.Normal) {
-                new MapMeta(meta).ApplyTo(area);
+                combinedMeta.ApplyTo(area);
+                for (int i = 0; i < combinedMeta.Modes.Length; i++) {
+                    combinedMeta.Modes[i]?.ApplyTo(area, (AreaMode) i);
+                }
                 Area = area.ToKey();
 
                 // Backup A-Side's Metadata. Only back up useful data.
-                area.SetASideAreaDataBackup(new AreaData {
+                area.ASideAreaDataBackup = new AreaData {
                     IntroType = area.IntroType,
                     ColorGrade = area.ColorGrade,
                     DarknessAlpha = area.DarknessAlpha,
@@ -188,21 +234,10 @@ namespace Celeste {
                     BloomStrength = area.BloomStrength,
                     CoreMode = area.CoreMode,
                     Dreaming = area.Dreaming
-                });
-            }
-
-            BinaryPacker.Element modeMeta = meta.Children?.FirstOrDefault(el => el.Name == "mode");
-            if (modeMeta == null)
-                return;
-
-            new MapMetaModeProperties(modeMeta).ApplyTo(area, mode);
-
-            // Metadata for B-Side and C-Side are parsed and stored.
-            if (mode != AreaMode.Normal) {
-                MapMeta mapMeta = new MapMeta(meta) {
-                    Modes = area.GetMeta().Modes
                 };
-                area.Mode[(int) mode].SetMapMeta(mapMeta);
+            } else {
+                area.Mode[(int) mode].MapMeta = combinedMeta;
+                combinedMeta.Modes[(int) mode]?.ApplyTo(area, mode);
             }
         }
 
@@ -257,6 +292,7 @@ namespace Celeste {
             }
         }
     }
+
     public static class MapDataExt {
 
         // Mods can't access patch_ classes directly.
@@ -265,18 +301,21 @@ namespace Celeste {
         /// <summary>
         /// Get the mod mode metadata of the map.
         /// </summary>
+        [Obsolete("Use MapData.Meta instead.")]
         public static MapMetaModeProperties GetMeta(this MapData self)
             => ((patch_MapData) self).Meta;
 
         /// <summary>
         /// Returns whether the map contains a cassette or not.
         /// </summary>
+        [Obsolete("Use MapData.DetectedCassette instead.")]
         public static bool GetDetectedCassette(this MapData self)
             => ((patch_MapData) self).DetectedCassette;
 
         /// <summary>
         /// To be called by the CoreMapDataProcessor when a cassette is detected in a map.
         /// </summary>
+        [Obsolete("Use MapData.DetectedCassette instead.")]
         internal static void SetDetectedCassette(this MapData self) {
             ((patch_MapData) self).DetectedCassette = true;
         }
@@ -284,12 +323,14 @@ namespace Celeste {
         /// <summary>
         /// Returns the number of strawberries in the map, including untracked ones (goldens, moons).
         /// </summary>
+        [Obsolete("Use MapData.DetectedStrawberriesIncludingUntracked instead.")]
         public static int GetDetectedStrawberriesIncludingUntracked(this MapData self)
             => ((patch_MapData) self).DetectedStrawberriesIncludingUntracked;
 
         /// <summary>
         /// To be called by the CoreMapDataProcessor when processing a map is over, to register the detected berry count.
         /// </summary>
+        [Obsolete("Use MapData.DetectedStrawberriesIncludingUntracked instead.")]
         internal static void SetDetectedStrawberriesIncludingUntracked(this MapData self, int count) {
             ((patch_MapData) self).DetectedStrawberriesIncludingUntracked = count;
         }
@@ -297,6 +338,7 @@ namespace Celeste {
         /// <summary>
         /// Returns the list of dashless goldens in the map.
         /// </summary>
+        [Obsolete("Use MapData.DashlessGoldenBerries instead.")]
         public static List<EntityData> GetDashlessGoldenberries(this MapData self)
             => ((patch_MapData) self).DashlessGoldenberries;
     }
@@ -319,6 +361,10 @@ namespace MonoMod {
             MethodDefinition m_Process = method.DeclaringType.FindMethod("Celeste.BinaryPacker/Element _Process(Celeste.BinaryPacker/Element,Celeste.MapData)");
             MethodDefinition m_GrowAndGet = method.DeclaringType.FindMethod("Celeste.EntityData _GrowAndGet(Celeste.EntityData[0...,0...]&,System.Int32,System.Int32)");
 
+            bool corruptedLevelDataFound = false;
+            bool binaryPackerFound = false;
+            bool strawberriesByCheckpointFound = false;
+
             bool pop = false;
             Mono.Collections.Generic.Collection<Instruction> instrs = method.Body.Instructions;
             ILProcessor il = method.Body.GetILProcessor();
@@ -332,6 +378,7 @@ namespace MonoMod {
                 if (pop && instr.OpCode == OpCodes.Throw) {
                     instr.OpCode = OpCodes.Pop;
                     pop = false;
+                    corruptedLevelDataFound = true;
                 }
 
                 if (instr.MatchCall("Celeste.BinaryPacker", "FromBinary")) {
@@ -339,17 +386,29 @@ namespace MonoMod {
 
                     instrs.Insert(instri++, il.Create(OpCodes.Ldarg_0));
                     instrs.Insert(instri++, il.Create(OpCodes.Call, m_Process));
+                    binaryPackerFound = true;
                 }
 
                 if (instri > 2 &&
                     instrs[instri - 3].MatchLdfld("Celeste.ModeProperties", "StrawberriesByCheckpoint") &&
-                    instr.MatchCallvirt("Celeste.EntityData[0...,0...]", "Celeste.EntityData Get(System.Int32,System.Int32)")
+                    instr.MatchCallOrCallvirt("Celeste.EntityData[0...,0...]", "Celeste.EntityData Get(System.Int32,System.Int32)")
                 ) {
                     instrs[instri - 3].OpCode = OpCodes.Ldflda;
                     instr.OpCode = OpCodes.Call;
                     instr.Operand = m_GrowAndGet;
                     instri++;
+                    strawberriesByCheckpointFound = true;
                 }
+            }
+
+            if (!corruptedLevelDataFound) {
+                throw new Exception("\"Corrupted Level Data\" not found in " + method.FullName + "!");
+            }
+            if (!binaryPackerFound) {
+                throw new Exception("No call to BinaryPacker.FromBinary found in " + method.FullName + "!");
+            }
+            if (!strawberriesByCheckpointFound) {
+                throw new Exception("No call to StrawberriesByCheckpoint found in " + method.FullName + "!");
             }
         }
 
